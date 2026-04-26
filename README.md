@@ -60,6 +60,11 @@ on:
     - cron: '0 3 * * 0'
   workflow_dispatch:
 
+# Caller MUST declare permissions ≥ reusable's permissions.
+# Reusable cannot escalate caller's GITHUB_TOKEN scope.
+permissions:
+  actions: write
+
 jobs:
   cleanup:
     uses: cutemo0953/.github/.github/workflows/cache-cleanup.yml@v1
@@ -138,3 +143,30 @@ consumers contradicts that goal.
 - ❌ Forking a reusable workflow into a consumer repo "because we
   needed a small tweak" — that's how copy-paste drift restarts. Fix
   in this repo, bump version, migrate consumer
+
+## Known leaky abstractions
+
+GitHub's reusable workflow design has constraints we cannot hide:
+
+1. **Caller permissions ≥ called permissions**
+   The `permissions:` block in a reusable workflow cannot escalate the
+   caller's `GITHUB_TOKEN` scope. If the reusable needs
+   `actions: write` (cache-cleanup) or any non-default scope, the
+   caller MUST also declare the same permissions, or the run fails
+   with `startup_failure` and zero jobs.
+   - cf-pages-deploy needs `contents: read` (default) → caller usually OK
+   - cache-cleanup needs `actions: write` → caller MUST declare
+   - actionlint needs `contents: read` (default) → caller usually OK
+   This is documented per workflow in the consumer wrapper examples
+   above. Lesson learned 2026-04-26: the first cache-cleanup pilot
+   migration failed with startup_failure for exactly this reason.
+
+2. **Cron triggers don't propagate from reusable**
+   Cron must be in the caller. Reusable workflows can only declare
+   `workflow_call:`. Means each consumer keeps a thin trigger file.
+   Acceptable trade-off for centralized logic.
+
+3. **Secrets must be `inherit`-ed or explicitly passed**
+   `secrets: inherit` in caller is the simplest pattern. Explicit
+   `secrets: { CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }} }`
+   works too if you want to be specific.
