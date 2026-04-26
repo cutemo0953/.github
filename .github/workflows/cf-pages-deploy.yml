@@ -1,0 +1,73 @@
+name: Reusable — Cloudflare Pages Deploy (vite-built)
+
+on:
+  workflow_call:
+    inputs:
+      project-name:
+        description: Cloudflare Pages project name
+        required: true
+        type: string
+      build-dir:
+        description: Directory passed to `pages deploy`
+        required: false
+        type: string
+        default: dist
+      node-version:
+        description: Node.js major version
+        required: false
+        type: string
+        default: '22'
+      build-command:
+        description: Command that produces the build-dir
+        required: false
+        type: string
+        default: npx vite build
+      working-directory:
+        description: Working directory for npm/build commands
+        required: false
+        type: string
+        default: '.'
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
+
+# Minimum privilege for the deploy job. Bumped to write only if the
+# workflow ever needs to commit back (it doesn't here).
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - run: npm ci
+        working-directory: ${{ inputs.working-directory }}
+
+      - run: ${{ inputs.build-command }}
+        working-directory: ${{ inputs.working-directory }}
+
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Pin wrangler 4 — bypass action's hardcoded 3.90.0 fallback on
+          # npx --no-install cache miss (root cause hypothesis of CF API
+          # 8000111). See post-mortem 2026-04-26.
+          wranglerVersion: '4'
+          # Override commit metadata to bypass wrangler 3.x auto-derive
+          # bug. Verified mitigation; pin above is hardening.
+          command: >-
+            pages deploy ${{ inputs.build-dir }}
+            --project-name ${{ inputs.project-name }}
+            --commit-hash=${{ github.sha }}
+            --commit-message="deploy ${{ github.sha }}"

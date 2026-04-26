@@ -1,0 +1,95 @@
+name: Reusable — Cleanup Actions Storage
+
+# Reusable cache + artifact cleanup. The script uses only
+# github.rest.actions.* APIs (no working tree access), so there is
+# intentionally no `actions/checkout` step and `permissions:` only
+# declares `actions: write`.
+#
+# History note: The original copy-pasted version included an
+# unnecessary actions/checkout step which failed on 2026-04-26 in 5
+# repos with "Repository not found" because the permissions block
+# (declared explicitly here) is deny-by-default and lacked
+# `contents: read`. Removing the checkout step is the correct fix.
+
+on:
+  workflow_call:
+    inputs:
+      cache-stale-days:
+        description: Delete caches not accessed in this many days
+        required: false
+        type: number
+        default: 7
+      artifact-keep-newest:
+        description: Always keep the newest N artifacts
+        required: false
+        type: number
+        default: 5
+      artifact-stale-days:
+        description: Delete artifacts older than this many days (after keeping newest N)
+        required: false
+        type: number
+        default: 7
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup old caches and artifacts
+        uses: actions/github-script@v7
+        env:
+          CACHE_STALE_DAYS: ${{ inputs.cache-stale-days }}
+          ARTIFACT_KEEP_NEWEST: ${{ inputs.artifact-keep-newest }}
+          ARTIFACT_STALE_DAYS: ${{ inputs.artifact-stale-days }}
+        with:
+          script: |
+            const cacheStaleDays = parseInt(process.env.CACHE_STALE_DAYS, 10);
+            const artifactKeepNewest = parseInt(process.env.ARTIFACT_KEEP_NEWEST, 10);
+            const artifactStaleDays = parseInt(process.env.ARTIFACT_STALE_DAYS, 10);
+
+            const cacheCutoff = Date.now() - cacheStaleDays * 24 * 60 * 60 * 1000;
+            const artifactCutoff = Date.now() - artifactStaleDays * 24 * 60 * 60 * 1000;
+
+            // Delete caches unused for cacheStaleDays+ days
+            const caches = await github.rest.actions.getActionsCacheList({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            let deletedCaches = 0;
+            for (const cache of caches.data.actions_caches) {
+              const lastUsed = new Date(cache.last_accessed_at).getTime();
+              if (lastUsed < cacheCutoff) {
+                await github.rest.actions.deleteActionsCacheById({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  cache_id: cache.id,
+                });
+                deletedCaches++;
+              }
+            }
+
+            // Delete artifacts older than artifactStaleDays (keep newest artifactKeepNewest)
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            let deletedArtifacts = 0;
+            const sorted = artifacts.data.artifacts.sort((a, b) =>
+              new Date(b.created_at) - new Date(a.created_at)
+            );
+            for (const art of sorted.slice(artifactKeepNewest)) {
+              const age = new Date(art.created_at).getTime();
+              if (age < artifactCutoff) {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: art.id,
+                });
+                deletedArtifacts++;
+              }
+            }
+            console.log(`Deleted ${deletedCaches} caches, ${deletedArtifacts} artifacts`);

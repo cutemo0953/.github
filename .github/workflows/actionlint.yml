@@ -1,0 +1,41 @@
+name: Reusable — actionlint warn-only
+
+# Catches the class of workflow bugs hit on 2026-04-26: missing
+# permission scopes, shell injection via expression interpolation,
+# missing required inputs, syntax errors.
+#
+# Hardening (2026-04-26 Codex P1):
+#  - actionlint download URL pinned to release tag (not main)
+#  - actionlint binary version pinned via env
+#  - explicit permissions: contents: read
+#  - curl -fsSL (loud failure on download error)
+
+on:
+  workflow_call:
+    inputs:
+      actionlint-version:
+        description: actionlint binary version to download
+        required: false
+        type: string
+        default: '1.7.12'
+      strict:
+        description: Fail the job on any actionlint finding (default warn-only)
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    env:
+      ACTIONLINT_VERSION: ${{ inputs.actionlint-version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run actionlint
+        continue-on-error: ${{ !inputs.strict }}
+        run: |
+          bash <(curl -fsSL "https://raw.githubusercontent.com/rhysd/actionlint/v${ACTIONLINT_VERSION}/scripts/download-actionlint.bash") "${ACTIONLINT_VERSION}"
+          ./actionlint -color
