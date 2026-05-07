@@ -1,0 +1,210 @@
+name: Reusable — SBOM (syft) + vulnerability scan (grype)
+
+# Produces CycloneDX + SPDX SBOMs and runs grype vulnerability scan against
+# the CycloneDX output. Designed for FDA premarket cybersecurity guidance
+# and 衛福部 負責任 AI 中心 SBOM 揭露要求 (iThome 175594, 2026-05-06).
+#
+# See spec: ~/Downloads/SPEC_SBOM.md (Rev 0.4, 2026-05-07).
+#
+# Hardening:
+#  - syft + grype binaries verified via cosign keyless signature
+#    (Anchore installer -v flag); cosign installed via sigstore action
+#  - install scripts fetched from a pinned release tag, not main
+#  - tool versions pinned via env (overridable per consumer)
+#  - input validation step: language / fail-on-severity against allowlist
+#    so typos fail loud at job start, not silently mid-pipeline
+#  - npm ci runs with --ignore-scripts: dependency postinstall MUST NOT
+#    execute inside an SBOM evidence workflow
+#  - grype.json written via .tmp → mv: failed scans never leave partial
+#    or stale grype.json that could be mistaken for completed scan
+#  - permissions block intentionally absent at workflow level: callers
+#    own job permissions; reusable cannot widen them, must not narrow
+#  - upload-artifact: if-no-files-found=warn; missing files don't block,
+#    but upload service / auth / quota failures still fail the job
+#  - release-asset upload uses !cancelled() so audit-relevant red runs
+#    (grype --fail-on triggered) still attach evidence to the release
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'Project language: node | go | docs'
+        required: true
+        type: string
+      artifact-prefix:
+        description: Artifact name prefix (e.g. irehab-doctor-sbom)
+        required: false
+        type: string
+        default: sbom
+      fail-on-severity:
+        description: 'grype severity that fails the job: critical | high | medium | none'
+        required: false
+        type: string
+        default: none
+      syft-version:
+        description: syft binary version (without leading v)
+        required: false
+        type: string
+        default: '1.18.1'
+      grype-version:
+        description: grype binary version (without leading v)
+        required: false
+        type: string
+        default: '0.85.0'
+      working-directory:
+        description: Directory to scan (defaults to repo root)
+        required: false
+        type: string
+        default: '.'
+      retention-days:
+        description: artifact retention in days
+        required: false
+        type: number
+        default: 90
+
+# Rapid pushes to main → cancel the older run; only the latest commit's
+# SBOM matters. release events get unique tags so cancel-in-progress
+# never triggers for them.
+concurrency:
+  group: sbom-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sbom:
+    runs-on: ubuntu-latest
+    env:
+      SYFT_VERSION: ${{ inputs.syft-version }}
+      GRYPE_VERSION: ${{ inputs.grype-version }}
+      FAIL_ON: ${{ inputs.fail-on-severity }}
+      LANG_INPUT: ${{ inputs.language }}
+      WORK_DIR: ${{ inputs.working-directory }}
+      PREFIX: ${{ inputs.artifact-prefix }}
+    steps:
+      - name: Validate inputs
+        run: |
+          case "$LANG_INPUT" in
+            node|go|docs) ;;
+            *) echo "::error::language must be one of: node, go, docs (got: $LANG_INPUT)"; exit 1 ;;
+          esac
+          case "$FAIL_ON" in
+            none|critical|high|medium) ;;
+            *) echo "::error::fail-on-severity must be one of: none, critical, high, medium (got: $FAIL_ON)"; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v5
+
+      - name: Setup Node (when language=node)
+        if: inputs.language == 'node'
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+
+      - name: npm ci --ignore-scripts (when language=node)
+        if: inputs.language == 'node'
+        # --ignore-scripts: dependency postinstall hooks must NOT execute
+        # in an SBOM evidence workflow. Lockfile-derived tree is the
+        # authoritative dependency graph for our SBOM purposes.
+        run: npm ci --ignore-scripts
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: Setup Go (when language=go)
+        if: inputs.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: go mod download (when language=go)
+        if: inputs.language == 'go'
+        run: go mod download
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: Install cosign (for syft/grype signature verification)
+        uses: sigstore/cosign-installer@v3.7.0
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Install syft (signature-verified)
+        run: |
+          # -v: Anchore installer verifies binary signature via cosign
+          # keyless when cosign is in PATH (which we just installed).
+          bash <(curl -fsSL "https://raw.githubusercontent.com/anchore/syft/v${SYFT_VERSION}/install.sh") -b /usr/local/bin -v "v${SYFT_VERSION}"
+          syft version
+
+      - name: Install grype (signature-verified)
+        run: |
+          bash <(curl -fsSL "https://raw.githubusercontent.com/anchore/grype/v${GRYPE_VERSION}/install.sh") -b /usr/local/bin -v "v${GRYPE_VERSION}"
+          grype version
+
+      - name: Generate SBOM (CycloneDX JSON)
+        working-directory: ${{ inputs.working-directory }}
+        run: syft . -o cyclonedx-json=sbom.cyclonedx.json
+
+      - name: Generate SBOM (SPDX JSON)
+        working-directory: ${{ inputs.working-directory }}
+        run: syft . -o spdx-json=sbom.spdx.json
+
+      - name: Run grype vulnerability scan
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          # Single-pass grype with evidence preservation:
+          #   - run grype once, capture exit code (don't let set -e abort)
+          #   - if tmp output is valid JSON → mv to grype.json (commit
+          #     evidence even when --fail-on triggered exit 1)
+          #   - if tmp is missing/invalid → grype hit infra error before
+          #     full write; remove tmp, leave grype.json absent
+          #   - finally re-emit grype's exit code so workflow status
+          #     reflects scan outcome (vuln fail OR infra fail)
+          # This is the only way to get failure-table semantics right:
+          #   vuln fail-on  → red + 3 files (SBOMs + grype.json)
+          #   infra fail    → red + 2 files (SBOMs only, no grype.json)
+          # `&& mv` would conflate the two and lose audit evidence in the
+          # vuln-fail case (Codex round-2 P1).
+          set +e
+          if [ "$FAIL_ON" = "none" ]; then
+            grype "sbom:sbom.cyclonedx.json" -o json > grype.json.tmp
+          else
+            grype "sbom:sbom.cyclonedx.json" -o json --fail-on "$FAIL_ON" > grype.json.tmp
+          fi
+          GRYPE_EXIT=$?
+          set -e
+          if jq -e . grype.json.tmp >/dev/null 2>&1; then
+            mv grype.json.tmp grype.json
+          else
+            rm -f grype.json.tmp
+          fi
+          exit $GRYPE_EXIT
+
+      - name: Upload SBOM + scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-${{ github.sha }}
+          path: |
+            ${{ inputs.working-directory }}/sbom.cyclonedx.json
+            ${{ inputs.working-directory }}/sbom.spdx.json
+            ${{ inputs.working-directory }}/grype.json
+          retention-days: ${{ inputs.retention-days }}
+          if-no-files-found: warn
+
+      - name: Attach to release (when triggered by release event)
+        # !cancelled() so audit-relevant red runs (grype --fail-on
+        # triggered) still attach evidence. Cancellation suppresses.
+        if: ${{ !cancelled() && github.event_name == 'release' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Move tag_name into env to prevent shell injection from a
+          # malicious tag name (e.g. "v1.0; rm -rf /"). NEVER interpolate
+          # github.event.* values directly into a run: script.
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          # Upload only files that actually exist; skip missing without
+          # failing. Missing files indicate an earlier-step failure that
+          # already turned the run red; we still attach what we have.
+          for f in sbom.cyclonedx.json sbom.spdx.json grype.json; do
+            if [ -f "$f" ]; then
+              gh release upload "$TAG_NAME" "$f" --clobber
+            fi
+          done
