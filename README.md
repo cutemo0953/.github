@@ -26,6 +26,7 @@ Reusable workflows physically eliminate this:
   cf-pages-deploy.yml      # workflow_call: vite build + Cloudflare Pages deploy
   cache-cleanup.yml        # workflow_call: cache + artifact cleanup via API
   actionlint.yml           # workflow_call: actionlint warn-only CI gate
+  sbom.yml                 # workflow_call: syft + grype + cosign — SBOM + vuln scan
 README.md                  # this file
 LICENSE                    # MIT
 ```
